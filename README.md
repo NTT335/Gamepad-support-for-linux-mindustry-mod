@@ -30,7 +30,7 @@ Instead of bundling external native binaries (`.so`), the mod reads Linux joysti
 3. **Install:**
    * Download or clone this repository into `~/.local/share/Mindustry/mods/`:
      ```bash
-     git clone [https://github.com/](https://github.com/)<your-username>/gamepad-support-linux-mindustry-mod.git ~/.local/share/Mindustry/mods/gamepad-support-linux
+        git clone [https://github.com/](https://github.com/)NTT335/Gamepad-support-for-linux-mindustry-mod.git ~/.local/share/Mindustry/mods/gamepad-support-linux
      ```
    * Or import the `.zip` archive directly in Mindustry via **Mods → Import Mod → Import File**.
 
@@ -127,7 +127,7 @@ If your controller driver maps buttons or axes differently, open `scripts/main.j
 3. **Установка:**
    * Клонируй репозиторий в папку модов Mindustry (`~/.local/share/Mindustry/mods/`):
      ```bash
-     git clone [https://github.com/](https://github.com/)<твой-ник>/gamepad-support-linux-mindustry-mod.git ~/.local/share/Mindustry/mods/gamepad-support-linux
+     git clone [https://github.com/](https://github.com/)NTT335/Gamepad-support-for-linux-mindustry-mod.git ~/.local/share/Mindustry/mods/gamepad-support-linux
      ```
    * Либо импортируй `.zip`-архив внутри игры через **Моды → Импортировать мод → Импортировать файл**.
 
