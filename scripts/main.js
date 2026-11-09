@@ -3,6 +3,9 @@
 var os = java.lang.System.getProperty("os.name").toLowerCase();
 if (Vars.headless || os.indexOf("linux") === -1) return;
 
+// ---------------------------------------------------------------------------
+//  Физические индексы кнопок (меняются в Настройки -> Контроллер)
+// ---------------------------------------------------------------------------
 var BTN_CROSS = 0;
 var BTN_CIRCLE = 1;
 var BTN_TRIANGLE = 2;
@@ -20,12 +23,20 @@ var AXIS_LX = 0, AXIS_LY = 1, AXIS_L2 = 2;
 var AXIS_RX = 3, AXIS_RY = 4, AXIS_R2 = 5;
 var AXIS_DPAD_X = 6, AXIS_DPAD_Y = 7;
 
+// Значения по умолчанию (перезаписываются из настроек в loadConfig)
 var ZOOM_IN_SIGN = 1;
 var ZOOM_SPEED = 0.05;
 var CURSOR_SPEED = 18;
 var CAM_PAN_SPEED = 12;
 var DEADZONE = 0.16;
 var SCENE_FLIP_Y = false;
+var cfgEnabled = true;
+var SCROLL_SPEED = 20;
+var SCROLL_INVERT = false;
+var menuDpadCd = 0;
+var cmdRow = 0, cmdCol = 0;
+var stanceLocal = {}, cmdLocalCmd = null;
+var pendingCtl = null;
 
 var MODE_NORMAL = 0, MODE_BUILD = 1, MODE_COMMAND = 2;
 
@@ -81,7 +92,107 @@ function logOnce(tag, e) {
 function toast(msg) {
     try { Vars.ui.hudfrag.showToast(msg); } catch (e) {}
 }
+function runnable(fn) {
+    return new java.lang.Runnable({ run: fn });
+}
 
+// ---------------------------------------------------------------------------
+//  Конфигурация (хранится в Core.settings, ключи "gp-*")
+// ---------------------------------------------------------------------------
+var BIND_DEFS = [
+    { key: "CROSS",    def: 0,  label: "Cross: клик в меню, действие, удержание — бросить / копировать" },
+    { key: "CIRCLE",   def: 1,  label: "Circle: назад, отмена, удержание — осмотр хранилища" },
+    { key: "TRIANGLE", def: 2,  label: "Triangle: пропуск волны, категории, выбрать всех юнитов" },
+    { key: "SQUARE",   def: 3,  label: "Square: исследования, выбор блока, поворот, режим юнитов" },
+    { key: "L1",       def: 4,  label: "L1: режим командования" },
+    { key: "R1",       def: 5,  label: "R1: режим строительства" },
+    { key: "L2",       def: 6,  label: "L2: обычный режим, закрыть окно" },
+    { key: "R2",       def: 7,  label: "R2: огонь, строить, выделять, клик в меню" },
+    { key: "SHARE",    def: 8,  label: "Share: пауза" },
+    { key: "OPTIONS",  def: 9,  label: "Options: меню паузы / назад" },
+    { key: "L3",       def: 11, label: "L3 (нажатие стика): приблизить камеру" },
+    { key: "R3",       def: 12, label: "R3 (нажатие стика): отдалить камеру" }
+];
+var CFG_KEYS = ["gp-enabled", "gp-cursor", "gp-pan", "gp-zoom", "gp-deadzone", "gp-hold", "gp-invzoom", "gp-flipy", "gp-scroll", "gp-scrollinv"];
+var PHYS_NAMES = ["Cross", "Circle", "Triangle", "Square", "L1", "R1", "L2", "R2", "Share", "Options", "PS", "L3", "R3"];
+var bindings = {};
+for (var bd = 0; bd < BIND_DEFS.length; bd++) bindings[BIND_DEFS[bd].key] = BIND_DEFS[bd].def;
+
+function applyBindings() {
+    BTN_CROSS = bindings.CROSS;
+    BTN_CIRCLE = bindings.CIRCLE;
+    BTN_TRIANGLE = bindings.TRIANGLE;
+    BTN_SQUARE = bindings.SQUARE;
+    BTN_L1 = bindings.L1;
+    BTN_R1 = bindings.R1;
+    BTN_L2 = bindings.L2;
+    BTN_R2 = bindings.R2;
+    BTN_SHARE = bindings.SHARE;
+    BTN_OPTIONS = bindings.OPTIONS;
+    BTN_L3 = bindings.L3;
+    BTN_R3 = bindings.R3;
+}
+
+// Все значения хранятся СТРОКАМИ: так Rhino/Arc не путают типы (Integer/Double),
+// из-за чего раньше getInt() мог падать, и настройки не применялись.
+var CFG_PREFIX = "gpv2-";
+
+function cfgGet(key) {
+    try {
+        var v = Core.settings.getString(CFG_PREFIX + key, "");
+        return (v == null) ? "" : String(v);
+    } catch (e) { return ""; }
+}
+function cfgInt(key, def) {
+    var n = parseInt(cfgGet(key), 10);
+    return isNaN(n) ? def : n;
+}
+function cfgBool(key, def) {
+    var s = cfgGet(key);
+    if (s === "1") return true;
+    if (s === "0") return false;
+    return def;
+}
+function cfgPut(key, v) {
+    try { Core.settings.put(CFG_PREFIX + key, String(v)); } catch (e) { logOnce("cfg put", e); }
+}
+function cfgRemove(key) {
+    try { Core.settings.remove(CFG_PREFIX + key); } catch (e) {}
+}
+function cfgFlush() {
+    try { Core.settings.forceSave(); } catch (e) {}
+}
+
+function loadConfig() {
+    cfgEnabled = cfgBool("gp-enabled", true);
+    CURSOR_SPEED = cfgInt("gp-cursor", 18);
+    CAM_PAN_SPEED = cfgInt("gp-pan", 12);
+    ZOOM_SPEED = cfgInt("gp-zoom", 50) / 1000;
+    DEADZONE = cfgInt("gp-deadzone", 16) / 100;
+    HOLD_FRAMES = cfgInt("gp-hold", 20);
+    ZOOM_IN_SIGN = cfgBool("gp-invzoom", false) ? -1 : 1;
+    SCENE_FLIP_Y = cfgBool("gp-flipy", false);
+    SCROLL_SPEED = cfgInt("gp-scroll", 20);
+    SCROLL_INVERT = cfgBool("gp-scrollinv", false);
+    for (var i = 0; i < BIND_DEFS.length; i++) {
+        var d = BIND_DEFS[i];
+        bindings[d.key] = cfgInt("gp-bind-" + d.key, d.def);
+    }
+    applyBindings();
+}
+
+function saveInt(key, v) { cfgPut(key, Math.round(v)); }
+function saveBool(key, v) { cfgPut(key, v ? "1" : "0"); }
+
+try { loadConfig(); } catch (e) { Log.warn("[Linux-Gamepad] loadConfig: " + e); }
+
+function active() {
+    return pad.connected && cfgEnabled;
+}
+
+// ---------------------------------------------------------------------------
+//  Ввод
+// ---------------------------------------------------------------------------
 function applyDeadzone(v) {
     v = v || 0;
     var a = Math.abs(v);
@@ -89,9 +200,10 @@ function applyDeadzone(v) {
     return (v < 0 ? -1 : 1) * Math.min(1, (a - DEADZONE) / (1 - DEADZONE));
 }
 
+// Физические кнопки 6 и 7 — триггеры: у них есть запасной вариант через оси.
 function rawDown(btn) {
-    if (btn === BTN_L2) return Boolean(pad.buttons[BTN_L2]) || (pad.axes[AXIS_L2] > 0.3);
-    if (btn === BTN_R2) return Boolean(pad.buttons[BTN_R2]) || (pad.axes[AXIS_R2] > 0.3);
+    if (btn === 6) return Boolean(pad.buttons[6]) || (pad.axes[AXIS_L2] > 0.3);
+    if (btn === 7) return Boolean(pad.buttons[7]) || (pad.axes[AXIS_R2] > 0.3);
     return Boolean(pad.buttons[btn]);
 }
 function isDown(btn) {
@@ -322,6 +434,7 @@ function setMode(m) {
         input.block = null;
     }
     if (m !== MODE_COMMAND) cmdSelecting = false;
+    if (m === MODE_COMMAND) { cmdRow = 0; cmdCol = 0; }
     placing = false; removing = false; linePoints = null;
     xHoldFrames = 0; copyArmed = false; copying = false;
     clipboard = null; pasteView = null;
@@ -386,20 +499,80 @@ function cycleUnitMode(player, units) {
     }
 }
 
-function handleMenu(dt) {
+function handleMenu(dt, capturing) {
     placing = false; removing = false; linePoints = null;
     copyArmed = false; copying = false;
     cArmed = false; cActed = false;
     inspectBuild = null; inspectHoverItem = null;
     nArmed = false; nDropped = false;
-    var mx = Mathf.clamp(applyDeadzone(pad.axes[AXIS_RX]) + applyDeadzone(pad.axes[AXIS_LX]), -1, 1);
-    var my = Mathf.clamp(-applyDeadzone(pad.axes[AXIS_RY]) - applyDeadzone(pad.axes[AXIS_LY]), -1, 1);
+
+    // Левый стик — курсор, правый стик — прокрутка (как колёсико мыши)
+    var mx = applyDeadzone(pad.axes[AXIS_LX]);
+    var my = -applyDeadzone(pad.axes[AXIS_LY]);
     moveCursor(mx, my, dt);
     syncMousePosition();
+
+    var rsx = applyDeadzone(pad.axes[AXIS_RX]);
+    var rsy = applyDeadzone(pad.axes[AXIS_RY]);
+    if (rsx !== 0 || rsy !== 0) {
+        try { scrollMenu(rsx, rsy, dt); } catch (e) { logOnce("menu scroll", e); }
+    }
+
+    // Пока ждём назначения кнопки — клики и выход из меню отключены
+    if (capturing) {
+        if (uiMouseDown) updateMenuMouseClick(false);
+        return;
+    }
+
+    // Крестовина влево/вправо над ползунком — точная подстройка значения
+    if (menuDpadCd > 0) menuDpadCd -= dt;
+    var ddx = Math.round(pad.axes[AXIS_DPAD_X] || 0);
+    if (ddx === 0) {
+        menuDpadCd = 0;
+    } else if (menuDpadCd <= 0) {
+        try { if (adjustSliderUnderCursor(ddx)) menuDpadCd = 6; } catch (e2) { logOnce("slider dpad", e2); }
+    }
 
     updateMenuMouseClick(isDown(BTN_CROSS) || isDown(BTN_R2));
 
     if (justPressed(BTN_CIRCLE) || justPressed(BTN_L2) || justPressed(BTN_OPTIONS)) triggerEscape();
+}
+
+// --- поиск элемента под курсором, прокрутка и подстройка ползунков ---
+function elementUnderCursor() {
+    var v = Core.scene.screenToStageCoordinates(new Vec2(Math.round(cursorX), sceneY()));
+    return Core.scene.hit(v.x, v.y, true);
+}
+
+function scrollMenu(sx, sy, dt) {
+    var dirY = SCROLL_INVERT ? -1 : 1;
+    var dx = sx * Math.abs(sx) * SCROLL_SPEED * dt;
+    var dy = sy * Math.abs(sy) * SCROLL_SPEED * dt * dirY;
+
+    var el = elementUnderCursor();
+    while (el != null) {
+        if (el instanceof JScrollPane) {
+            var movedY = false, movedX = false;
+            if (dy !== 0 && el.getMaxY() > 0) { el.setScrollY(el.getScrollY() + dy); movedY = true; }
+            if (dx !== 0 && el.getMaxX() > 0) { el.setScrollX(el.getScrollX() + dx); movedX = true; }
+            if (movedY || movedX) return;
+        }
+        el = el.parent;
+    }
+    // Запасной вариант — обычное событие колёсика
+    try { Core.scene.scrolled(dx * 0.02, dy * 0.02); } catch (e) {}
+}
+
+function adjustSliderUnderCursor(dir) {
+    var el = elementUnderCursor();
+    while (el != null) {
+        if (el instanceof JSlider) {
+            el.setValue(el.getValue() + dir * el.getStepSize());
+            return true;
+        }
+        el = el.parent;
+    }
+    return false;
 }
 
 function handleGame(dt) {
@@ -411,6 +584,8 @@ function handleGame(dt) {
     var alive = !player.dead();
     var unit = alive ? player.unit() : null;
     var input = Vars.control.input;
+
+    processPendingControl(player);
 
     if (justPressed(BTN_OPTIONS)) { triggerEscape(); return; }
     if (justPressed(BTN_SHARE)) togglePause();
@@ -456,6 +631,45 @@ function panCamera(dpadX, dpadY, dt) {
     Core.camera.position.add(dpadX * step, dpadY * step);
 }
 
+// Вселение в турель / управляемый блок.
+// Сначала пробуем штатный вызов игры; если игра не переключила управление
+// (в одиночной игре) — переключаем напрямую через player.unit(blockUnit).
+function tryControlBuilding(player, unit, b) {
+    var can = false;
+    try { can = !!b.canControlSelect(unit); } catch (e) { can = false; }
+    var bu = null;
+    try { bu = b.unit(); } catch (e2) { bu = null; }
+    if (!can && bu == null) return false;
+
+    stopMining(unit);
+    try { Call.buildingControlSelect(player, b); } catch (e3) { logOnce("buildingControlSelect", e3); }
+    pendingCtl = { b: b, t: 0 };
+    return true;
+}
+
+function processPendingControl(player) {
+    if (pendingCtl == null) return;
+    pendingCtl.t += 1;
+    if (pendingCtl.t < 6) return;
+    var pb = pendingCtl.b;
+    pendingCtl = null;
+    try {
+        if (!pb.isValid() || player.dead()) return;
+        var bu = pb.unit();
+        if (bu == null) return;
+        if (player.unit() === bu) {
+            toast("[accent]Управление: [white]" + pb.block.localizedName);
+            return;
+        }
+        if (Vars.net.active()) { toast("[scarlet]Не удалось вселиться в " + pb.block.localizedName); return; }
+        var okCtl = true;
+        try { if (typeof pb.canControl === "function") okCtl = !!pb.canControl(); } catch (e0) {}
+        if (!okCtl) { toast("[scarlet]Эта турель не поддаётся ручному управлению"); return; }
+        player.unit(bu);
+        toast("[accent]Управление: [white]" + pb.block.localizedName);
+    } catch (e) { logOnce("control fallback", e); }
+}
+
 function tapAction(player, unit, wx, wy) {
     var target = Units.closest(player.team(), wx, wy, 30, function (u) {
         return !u.isPlayer() && u.type.playerControllable && !u.dead;
@@ -466,10 +680,8 @@ function tapAction(player, unit, wx, wy) {
         return;
     }
     var b = Vars.world.buildWorld(wx, wy);
-    if (b != null && b.team === player.team() && unit != null && b.canControlSelect(unit)) {
-        stopMining(unit);
-        Call.buildingControlSelect(player, b);
-        return;
+    if (b != null && b.team === player.team() && unit != null) {
+        if (tryControlBuilding(player, unit, b)) return;
     }
     var ore = Vars.world.tileWorld(wx, wy);
     if (unit && ore != null && ore.block() === Blocks.air && ore.drop() != null) {
@@ -953,7 +1165,9 @@ function commandMode(player, unit, wx, wy, dpadX, dpadY, dt) {
     player.shooting = false;
     try { input.commandMode = true; } catch (e) {}
 
-    panCamera(dpadX, dpadY, dt);
+    // Крестовина — перемещение по панели команд / стоек
+    var pdata = cmdPanelData(sel);
+    cmdPanelNav(pdata, dpadX, dpadY, dt);
 
     if (justPressed(BTN_R2)) {
         cmdSelecting = true; cmdStartX = wx; cmdStartY = wy;
@@ -994,18 +1208,520 @@ function commandMode(player, unit, wx, wy, dpadX, dpadY, dt) {
         });
     }
 
-    if (justPressed(BTN_SQUARE)) cycleUnitMode(player, sel);
+    // Квадрат — выбрать / отменить пункт панели под курсором-рамкой
+    if (justPressed(BTN_SQUARE)) cmdPanelActivate(player, sel, pdata);
 }
 
+// ---------------------------------------------------------------------------
+//  Настройки -> Контроллер (страница вставляется сразу после «Управление»)
+// ---------------------------------------------------------------------------
+var JTable = Packages.arc.scene.ui.layout.Table;
+var JStack = Packages.arc.scene.ui.layout.Stack;
+var JSlider = Packages.arc.scene.ui.Slider;
+var JLabel = Packages.arc.scene.ui.Label;
+var JCheckBox = Packages.arc.scene.ui.CheckBox;
+var JScrollPane = Packages.arc.scene.ui.ScrollPane;
+var JTouchable = Packages.arc.scene.event.Touchable;
+var JBaseDialog = Packages.mindustry.ui.dialogs.BaseDialog;
+var JStyles = Packages.mindustry.ui.Styles;
+var JIcon = Packages.mindustry.gen.Icon;
+
+var ctrlDialog = null, ctrlContent = null, ctrlBtn = null;
+var menuObj = null, menuSearched = false;
+
+var bindButtons = {}, capShownSec = -1;
+var capKey = null, capEnd = 0, capStart = 0, capWaitRelease = true;
+var CAP_TIMEOUT_MS = 8000;
+
+function physName(i) {
+    var n = (i >= 0 && i < PHYS_NAMES.length) ? PHYS_NAMES[i] : "Button";
+    return "#" + i + " " + n;
+}
+
+function rowWidth() {
+    return Math.min(Core.graphics.getWidth() / 1.2, 560);
+}
+
+function addHeader(t, text) {
+    t.add(text).color(Pal.accent).padTop(14).padBottom(4).left().row();
+    t.image().color(Pal.accent).height(3).growX().padBottom(6).row();
+}
+
+function addSlider(t, title, key, def, min, max, step, fmt) {
+    var slider = new JSlider(min, max, step, false);
+    slider.setValue(cfgInt(key, def));
+
+    var value = new JLabel("", JStyles.outlineLabel);
+    var content = new JTable();
+    content.add(title, JStyles.outlineLabel).left().growX().wrap();
+    content.add(value).padLeft(10).right();
+    content.margin(3, 33, 3, 33);
+    content.touchable = JTouchable.disabled;
+
+    value.setText(fmt(Math.round(slider.getValue())));
+    slider.changed(runnable(function () {
+        var v = Math.round(slider.getValue());
+        saveInt(key, v);
+        value.setText(fmt(v));
+        loadConfig();
+    }));
+
+    var st = new JStack();
+    st.add(slider);
+    st.add(content);
+    t.add(st).width(rowWidth()).left().padTop(4).row();
+}
+
+function addCheck(t, title, key, def) {
+    var cb = new JCheckBox(title);
+    cb.setChecked(cfgBool(key, def));
+    cb.changed(runnable(function () {
+        saveBool(key, cb.isChecked());
+        loadConfig();
+    }));
+    t.add(cb).left().padTop(4).row();
+}
+
+function addBindRow(t, def) {
+    var row = new JTable();
+    row.add(def.label).left().growX().wrap().padRight(12);
+    var cell = row.button(physName(bindings[def.key]), runnable(function () {
+        if (capKey === def.key) endCapture(); else beginCapture(def.key);
+    }));
+    cell.size(210, 44);
+    bindButtons[def.key] = cell.get();
+    t.add(row).width(rowWidth()).left().padTop(4).row();
+}
+
+function resetControllerSettings() {
+    for (var i = 0; i < CFG_KEYS.length; i++) cfgRemove(CFG_KEYS[i]);
+    for (var j = 0; j < BIND_DEFS.length; j++) cfgRemove("gp-bind-" + BIND_DEFS[j].key);
+    loadConfig();
+    rebuildCtrlContent();
+    toast("[accent]Настройки контроллера сброшены");
+}
+
+function rebuildCtrlContent() {
+    var t = ctrlContent;
+    if (t == null) return;
+    capKey = null;
+    bindButtons = {};
+    t.clearChildren();
+    t.top();
+
+    t.add(pad.connected ? "[green]Контроллер подключён" : "[scarlet]Контроллер не найден (/dev/input/js*)").left().padTop(6).row();
+    t.add("[lightgray]Меню: левый стик — курсор, правый стик — прокрутка, крестовина ←/→ над ползунком — точная настройка").left().width(rowWidth()).wrap().padTop(4).row();
+
+    addHeader(t, "Общие");
+    addCheck(t, "Включить поддержку контроллера", "gp-enabled", true);
+
+    addHeader(t, "Чувствительность");
+    addSlider(t, "Скорость курсора", "gp-cursor", 18, 4, 50, 1, function (v) { return "" + v; });
+    addSlider(t, "Скорость камеры (крестовина)", "gp-pan", 12, 2, 40, 1, function (v) { return "" + v; });
+    addSlider(t, "Скорость зума", "gp-zoom", 50, 5, 200, 5, function (v) { return (v / 1000).toFixed(3); });
+    addSlider(t, "Мёртвая зона стиков", "gp-deadzone", 16, 0, 50, 1, function (v) { return v + "%"; });
+    addSlider(t, "Время удержания кнопки", "gp-hold", 20, 5, 60, 1, function (v) { return (v / 60).toFixed(2) + " с"; });
+    addSlider(t, "Скорость прокрутки в меню (правый стик)", "gp-scroll", 20, 2, 80, 1, function (v) { return "" + v; });
+
+    addHeader(t, "Дополнительно");
+    addCheck(t, "Инвертировать зум (L3 / R3)", "gp-invzoom", false);
+    addCheck(t, "Инвертировать ось Y курсора в меню", "gp-flipy", false);
+    addCheck(t, "Инвертировать прокрутку в меню", "gp-scrollinv", false);
+
+    addHeader(t, "Назначение кнопок");
+    for (var i = 0; i < BIND_DEFS.length; i++) addBindRow(t, BIND_DEFS[i]);
+
+    t.button("Сбросить всё по умолчанию", JIcon.refresh, runnable(resetControllerSettings)).size(320, 54).padTop(20).padBottom(10).row();
+}
+
+function buildCtrlDialog() {
+    ctrlDialog = new JBaseDialog("Настройки контроллера");
+    ctrlDialog.addCloseButton();
+    try { ctrlDialog.hidden(runnable(function () { capKey = null; cfgFlush(); })); } catch (eh) {}
+    ctrlContent = new JTable();
+    var pane = new JScrollPane(ctrlContent);
+    pane.setScrollingDisabled(true, false);
+    pane.setFlickScroll(false);
+    pane.setFadeScrollBars(false);
+    ctrlDialog.cont.add(pane).grow();
+}
+
+function openCtrlSettings() {
+    try {
+        if (ctrlDialog == null) buildCtrlDialog();
+        rebuildCtrlContent();
+        ctrlDialog.show();
+    } catch (e) { logOnce("open controller settings", e); }
+}
+
+// --- назначение кнопки (прямо в строке, курсор при этом продолжает работать) ---
+function bindingLabel(key) {
+    for (var i = 0; i < BIND_DEFS.length; i++) if (BIND_DEFS[i].key === key) return BIND_DEFS[i].label.split(":")[0];
+    return key;
+}
+
+function refreshBindButtons() {
+    var now = java.lang.System.currentTimeMillis();
+    for (var i = 0; i < BIND_DEFS.length; i++) {
+        var k = BIND_DEFS[i].key;
+        var btn = bindButtons[k];
+        if (btn == null) continue;
+        try {
+            if (capKey === k) btn.setText("Нажмите кнопку... " + Math.max(0, Math.ceil((capEnd - now) / 1000)));
+            else btn.setText(physName(bindings[k]));
+        } catch (e) {}
+    }
+}
+
+function beginCapture(key) {
+    capKey = key;
+    capStart = java.lang.System.currentTimeMillis();
+    capEnd = capStart + CAP_TIMEOUT_MS;
+    capWaitRelease = true;
+    capShownSec = -1;
+    refreshBindButtons();
+}
+
+function endCapture() {
+    capKey = null;
+    refreshBindButtons();
+}
+
+function bindButton(key, idx) {
+    var old = bindings[key];
+    var swapped = null;
+    for (var i = 0; i < BIND_DEFS.length; i++) {
+        var d = BIND_DEFS[i];
+        if (d.key !== key && bindings[d.key] === idx) {
+            bindings[d.key] = old;
+            saveInt("gp-bind-" + d.key, old);
+            swapped = d.key;
+        }
+    }
+    bindings[key] = idx;
+    saveInt("gp-bind-" + key, idx);
+    applyBindings();
+    cfgFlush();
+    refreshBindButtons();
+    if (swapped != null) toast("[accent]" + bindingLabel(swapped) + " получила " + physName(old));
+}
+
+// Возвращает true, пока идёт ожидание нажатия.
+function captureTick() {
+    if (capKey == null) return false;
+    var now = java.lang.System.currentTimeMillis();
+    if (ctrlDialog == null || (now - capStart > 500 && !ctrlDialog.isShown())) {
+        capKey = null;
+        return false;
+    }
+    if (now >= capEnd) {
+        endCapture();
+        return false;
+    }
+    var sec = Math.ceil((capEnd - now) / 1000);
+    if (sec !== capShownSec) { capShownSec = sec; refreshBindButtons(); }
+
+    if (capWaitRelease) {
+        var any = false;
+        for (var i = 0; i < 20; i++) if (rawDown(i)) { any = true; break; }
+        if (!any) capWaitRelease = false;
+        return true;
+    }
+    for (var b = 0; b < 20; b++) {
+        if (rawDown(b)) {
+            var key = capKey;
+            capKey = null;
+            bindButton(key, b);
+            suppressAllHeld();
+            return true;
+        }
+    }
+    return true;
+}
+
+// --- вставка кнопки в меню настроек сразу после «Управление» ---
+function cellText(a) {
+    try { return String(a.getText()); } catch (e) { return null; }
+}
+
+function menuHasControls(tbl, ctrlText) {
+    try {
+        var cells = tbl.getCells();
+        for (var i = 0; i < cells.size; i++) {
+            var a = cells.get(i).get();
+            if (a != null && cellText(a) === ctrlText) return true;
+        }
+    } catch (e) {}
+    return false;
+}
+
+function findSettingsMenu(dlg) {
+    var ctrlText = String(Core.bundle.get("settings.controls"));
+    var c = dlg.getClass();
+    while (c != null) {
+        var fs = c.getDeclaredFields();
+        for (var i = 0; i < fs.length; i++) {
+            try {
+                fs[i].setAccessible(true);
+                var v = fs[i].get(dlg);
+                if (v != null && typeof v.getCells === "function" && menuHasControls(v, ctrlText)) return v;
+            } catch (e) {}
+        }
+        c = c.getSuperclass();
+    }
+    return null;
+}
+
+function createCtrlButton() {
+    var tmp = new JTable();
+    var ic = JIcon.wrench;
+    if (ic == null) ic = JIcon.settings;
+    var isz = (Vars.iconMed != null) ? Vars.iconMed : 32;
+    var b = tmp.button("Контроллер", ic, JStyles.flatt, isz, runnable(openCtrlSettings)).get();
+    try { b.marginLeft(8); } catch (e) {}
+    b.name = "gamepad-settings-button";
+    return b;
+}
+
+function ensureCtrlButton() {
+    if (Vars.ui == null || Vars.ui.settings == null) return;
+    if (!menuSearched) {
+        menuSearched = true;
+        menuObj = findSettingsMenu(Vars.ui.settings);
+        if (menuObj == null) Log.warn("[Linux-Gamepad] Settings menu table not found; controller settings button not added");
+    }
+    var menu = menuObj;
+    if (menu == null) return;
+    if (ctrlBtn == null) ctrlBtn = createCtrlButton();
+    if (ctrlBtn.parent === menu) return;
+
+    var cells = menu.getCells();
+    var actors = [];
+    for (var i = 0; i < cells.size; i++) {
+        var a = cells.get(i).get();
+        if (a != null && a !== ctrlBtn) actors.push(a);
+    }
+
+    var ctrlText = String(Core.bundle.get("settings.controls"));
+    var at = -1;
+    for (var j = 0; j < actors.length; j++) {
+        if (cellText(actors[j]) === ctrlText) { at = j; break; }
+    }
+    if (at < 0) at = Math.min(4, actors.length - 1);
+
+    menu.clearChildren();
+    menu.defaults().size(300, 60);
+    try { ctrlBtn.remove(); } catch (e) {}
+    for (var k = 0; k < actors.length; k++) {
+        menu.add(actors[k]).row();
+        if (k === at) menu.add(ctrlBtn).row();
+    }
+    if (actors.length === 0) menu.add(ctrlBtn).row();
+}
+
+function uiTick() {
+    ensureCtrlButton();
+}
+
+// ---------------------------------------------------------------------------
+//  Панель «Режим командования» (всегда видна в режиме командования)
+// ---------------------------------------------------------------------------
+function cmdPanelData(sel) {
+    var first = (sel.size > 0) ? sel.get(0) : null;
+    var d = { first: first, count: sel.size, cmds: [], stances: [] };
+    if (first != null) {
+        try { d.cmds = seqToArray(first.type.commands); } catch (e) {}
+        try { d.stances = seqToArray(first.type.stances); } catch (e2) {}
+    }
+    return d;
+}
+
+function cmdPanelClamp(data) {
+    var rows = [data.cmds, data.stances];
+    if (rows[cmdRow].length === 0 && rows[1 - cmdRow].length > 0) cmdRow = 1 - cmdRow;
+    var n = rows[cmdRow].length;
+    cmdCol = (n === 0) ? 0 : Mathf.clamp(cmdCol, 0, n - 1);
+}
+
+function cmdPanelNav(data, dpadX, dpadY, dt) {
+    if (dpadCooldown > 0) dpadCooldown -= dt;
+    if (dpadX === 0 && dpadY === 0) { dpadCooldown = 0; return; }
+    if (dpadCooldown > 0) return;
+    dpadCooldown = 10;
+
+    cmdPanelClamp(data);
+    var rows = [data.cmds, data.stances];
+    if (dpadY !== 0) {
+        var other = 1 - cmdRow;
+        if (rows[other].length > 0) cmdRow = other;
+    }
+    if (dpadX !== 0) {
+        var n = rows[cmdRow].length;
+        if (n > 0) cmdCol = (cmdCol + dpadX + n) % n;
+    }
+    cmdPanelClamp(data);
+}
+
+function cmdItemName(o) {
+    try { return String(o.localized()); } catch (e) { return String(o.name); }
+}
+
+function cmdItemIcon(o) {
+    try { var ic = o.getIcon(); if (ic != null) return ic; } catch (e) {}
+    try { var ic2 = JIcon.icons.get(o.icon); if (ic2 != null) return ic2; } catch (e2) {}
+    return null;
+}
+
+function isCmdActive(first, obj) {
+    if (first == null) return false;
+    try {
+        var c = first.controller();
+        if (c.command !== undefined) return c.command === obj;
+    } catch (e) {}
+    return cmdLocalCmd === obj;
+}
+
+function isStanceActive(first, st) {
+    if (first == null) return false;
+    try {
+        var c = first.controller();
+        if (typeof c.hasStance === "function") return !!c.hasStance(st);
+    } catch (e) {}
+    try {
+        var c2 = first.controller();
+        if (c2.stances != null && typeof c2.stances.contains === "function") return !!c2.stances.contains(st);
+    } catch (e2) {}
+    return !!stanceLocal[String(st.name)];
+}
+
+function cmdPanelActivate(player, sel, data) {
+    cmdPanelClamp(data);
+    var row = (cmdRow === 0) ? data.cmds : data.stances;
+    if (sel.size === 0 || row.length === 0) { toast("[lightgray]Сначала выберите юнитов (R2 / △)"); return; }
+    var obj = row[cmdCol];
+    var ids = unitIds(sel);
+    try {
+        if (cmdRow === 0) {
+            var target = obj;
+            if (isCmdActive(data.first, obj)) {
+                // «Отмена» команды — возвращаем обычное перемещение
+                var def = null;
+                try { def = UnitCommand.moveCommand; } catch (e0) {}
+                if (def == null && data.cmds.length > 0) def = data.cmds[0];
+                if (def != null) target = def;
+            }
+            Call.setUnitCommand(player, ids, target);
+            cmdLocalCmd = target;
+            toast((target === obj ? "[accent]Команда: [white]" : "[lightgray]Отмена, команда: [white]") + cmdItemName(target));
+        } else {
+            var on = !isStanceActive(data.first, obj);
+            try { Call.setUnitStance(player, ids, obj, on); }
+            catch (e1) { Call.setUnitStance(player, ids, obj); }
+            stanceLocal[String(obj.name)] = on;
+            toast((on ? "[accent]Стойка включена: [white]" : "[lightgray]Стойка отключена: [white]") + cmdItemName(obj));
+        }
+    } catch (e) { logOnce("cmd panel activate", e); }
+}
+
+function drawCommandPanel(w, h) {
+    var sel = Vars.control.input.selectedUnits;
+    var data = cmdPanelData(sel);
+    cmdPanelClamp(data);
+
+    var ITEM = 46, GAP = 6, PAD = 12;
+    var nMax = Math.max(data.cmds.length, data.stances.length, 4);
+    var pw = Math.max(340, PAD * 2 + nMax * (ITEM + GAP) - GAP);
+    var ph = 262;
+    var px = 20, py = Math.round(h * 0.55) - ph;
+    var f = Fonts.outline;
+
+    Draw.color(0, 0, 0, 0.78);
+    Fill.rect(px + pw / 2, py + ph / 2, pw, ph);
+    Lines.stroke(2, Pal.accent);
+    Lines.rect(px, py, pw, ph);
+    Draw.reset();
+
+    var y = py + ph - PAD;
+    f.draw("[accent]Режим командования", px + pw / 2, y, Align.center);
+    y -= 28;
+    Lines.stroke(2, Pal.accent);
+    Lines.line(px + PAD, y, px + pw - PAD, y);
+    Draw.reset();
+    y -= 8;
+
+    if (data.first != null) {
+        try { Draw.rect(data.first.type.uiIcon, px + PAD + 18, y - 18, 32, 32); } catch (e) {}
+        Draw.reset();
+        f.draw("[white]Выбрано: " + data.count, px + PAD + 44, y - 10, Align.left);
+    } else {
+        f.draw("[scarlet]Нет выбранных юнитов", px + PAD, y - 10, Align.left);
+    }
+    y -= 40;
+
+    var labels = ["Команды", "Стойки"];
+    var rows = [data.cmds, data.stances];
+    for (var r = 0; r < 2; r++) {
+        f.draw("[lightgray]" + labels[r], px + PAD, y, Align.left);
+        y -= 18;
+        var items = rows[r];
+        for (var i = 0; i < items.length; i++) {
+            var o = items[i];
+            var ix = px + PAD + i * (ITEM + GAP), iy = y - ITEM;
+            var focused = (cmdRow === r && cmdCol === i);
+            var on = (r === 0) ? isCmdActive(data.first, o) : isStanceActive(data.first, o);
+
+            Draw.color(0.08, 0.08, 0.08, 0.95);
+            Fill.rect(ix + ITEM / 2, iy + ITEM / 2, ITEM, ITEM);
+            if (on) {
+                Draw.color(Pal.accent, 0.35);
+                Fill.rect(ix + ITEM / 2, iy + ITEM / 2, ITEM, ITEM);
+            }
+            Draw.reset();
+
+            var ic = cmdItemIcon(o);
+            if (ic != null) {
+                try { Draw.color(Color.white); ic.draw(ix + 8, iy + 8, ITEM - 16, ITEM - 16); } catch (e1) {}
+                Draw.reset();
+            } else {
+                f.draw("[white]" + cmdItemName(o).substring(0, 3), ix + ITEM / 2, iy + ITEM / 2 + 6, Align.center);
+            }
+
+            Lines.stroke(focused ? 3 : 1, focused ? Pal.accent : Color.gray);
+            Lines.rect(ix, iy, ITEM, ITEM);
+            Draw.reset();
+        }
+        y -= ITEM + 8;
+    }
+
+    var fr = (cmdRow === 0) ? data.cmds : data.stances;
+    if (data.count === 0) {
+        f.draw("[lightgray]Выберите юнитов: R2 или △ (всех)", px + PAD, y, Align.left);
+    } else {
+        var nm = (fr.length > 0) ? "[accent]" + cmdItemName(fr[cmdCol]) + "  " : "";
+        f.draw(nm + "[lightgray]□ — выбрать/отмена", px + PAD, y, Align.left);
+    }
+    Draw.reset();
+}
+
+// ---------------------------------------------------------------------------
+//  Главный цикл
+// ---------------------------------------------------------------------------
 function onFrame() {
-    if (!pad.connected) {
+    if (!active()) {
         if (uiMouseDown) updateMenuMouseClick(false);
         return;
     }
     var dt = Math.min(Core.graphics.getDeltaTime() * 60, 4);
     var inUI = Vars.state.isMenu() || Core.scene.hasDialog();
 
-    if (inUI) handleMenu(dt);
+    if (captureTick()) {
+        handleMenu(dt, true);
+        wasInUI = true;
+        savePrevState();
+        return;
+    }
+
+    if (inUI) handleMenu(dt, false);
     else handleGame(dt);
 
     wasInUI = inUI;
@@ -1014,8 +1730,10 @@ function onFrame() {
 
 Core.app.post(new java.lang.Runnable({
     run: function () {
+        try { loadConfig(); } catch (e0) { logOnce("loadConfig", e0); }
         Core.app.addListener(new ApplicationListener({
             update: function () {
+                try { uiTick(); } catch (e1) { logOnce("settings ui", e1); }
                 try { onFrame(); } catch (e) { logOnce("update", e); }
             }
         }));
@@ -1024,7 +1742,7 @@ Core.app.post(new java.lang.Runnable({
 
 Events.run(Trigger.draw, function () {
     try {
-        if (!pad.connected || !Vars.state.isGame()) return;
+        if (!active() || !Vars.state.isGame()) return;
         if (currentMode === MODE_BUILD) {
             Draw.z(Layer.overlayUI);
             var pb = Vars.control.input.block;
@@ -1078,7 +1796,7 @@ Events.run(Trigger.draw, function () {
 try {
     Events.run(Trigger.uiDrawEnd, function () {
         try {
-            if (!pad.connected || cursorX < 0) return;
+            if (!active() || cursorX < 0) return;
             var w = Core.graphics.getWidth(), h = Core.graphics.getHeight();
             Draw.proj(Tmp.m1.setOrtho(0, 0, w, h));
 
@@ -1126,6 +1844,8 @@ try {
                 }
                 Draw.reset();
             }
+
+            if (!inUI && Vars.state.isGame() && currentMode === MODE_COMMAND) drawCommandPanel(w, h);
 
             Lines.stroke(4, Color.black);
             Lines.circle(cursorX, cursorY, 6);
