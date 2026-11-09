@@ -73,11 +73,6 @@ var miningTile = null;
 
 var nArmed = false, nHold = 0, nDropped = false;
 
-var cArmed = false, cHold = 0, cActed = false;
-var inspectBuild = null;
-var inspectHoverItem = null;
-var PANEL_X = 20, PANEL_W = 210, PANEL_ROW_H = 30, PANEL_GAP = 4;
-
 var cmdSelecting = false, cmdStartX = 0, cmdStartY = 0;
 var cmdCycleIndex = 0;
 
@@ -97,11 +92,11 @@ function runnable(fn) {
 }
 
 // ---------------------------------------------------------------------------
-//  Конфигурация (хранится в Core.settings, ключи "gp-*")
+//  Конфигурация (хранится в Core.settings, ключи "gpv2-*")
 // ---------------------------------------------------------------------------
 var BIND_DEFS = [
-    { key: "CROSS",    def: 0,  label: "Cross: клик в меню, действие, удержание — бросить / копировать" },
-    { key: "CIRCLE",   def: 1,  label: "Circle: назад, отмена, удержание — осмотр хранилища" },
+    { key: "CROSS",    def: 0,  label: "Cross: клик / ресурсы / конфигурация, удержание — скинуть / копировать" },
+    { key: "CIRCLE",   def: 1,  label: "Circle: вселиться (юнит/турель/маршрутизатор) или возродиться в ядре" },
     { key: "TRIANGLE", def: 2,  label: "Triangle: пропуск волны, категории, выбрать всех юнитов" },
     { key: "SQUARE",   def: 3,  label: "Square: исследования, выбор блока, поворот, режим юнитов" },
     { key: "L1",       def: 4,  label: "L1: режим командования" },
@@ -133,8 +128,6 @@ function applyBindings() {
     BTN_R3 = bindings.R3;
 }
 
-// Все значения хранятся СТРОКАМИ: так Rhino/Arc не путают типы (Integer/Double),
-// из-за чего раньше getInt() мог падать, и настройки не применялись.
 var CFG_PREFIX = "gpv2-";
 
 function cfgGet(key) {
@@ -200,7 +193,6 @@ function applyDeadzone(v) {
     return (v < 0 ? -1 : 1) * Math.min(1, (a - DEADZONE) / (1 - DEADZONE));
 }
 
-// Физические кнопки 6 и 7 — триггеры: у них есть запасной вариант через оси.
 function rawDown(btn) {
     if (btn === 6) return Boolean(pad.buttons[6]) || (pad.axes[AXIS_L2] > 0.3);
     if (btn === 7) return Boolean(pad.buttons[7]) || (pad.axes[AXIS_R2] > 0.3);
@@ -344,6 +336,13 @@ function updateMenuMouseClick(clickHeld) {
     }
 }
 
+function clickSceneAtCursor() {
+    var sx = Math.round(cursorX);
+    var sy = sceneY();
+    Core.scene.touchDown(sx, sy, 0, KeyCode.mouseLeft);
+    Core.scene.touchUp(sx, sy, 0, KeyCode.mouseLeft);
+}
+
 function triggerEscape() {
     if (Core.scene.hasDialog()) {
         var d = Core.scene.getDialog();
@@ -360,13 +359,30 @@ function togglePause() {
     else if (Vars.state.isPlaying()) Vars.state.set(S.paused);
 }
 
+// ---------------------------------------------------------------------------
+//  Доступность блоков точно по правилам текущей карты / планеты / песочницы
+// ---------------------------------------------------------------------------
+function isBlockAvailable(b) {
+    if (b == null || b.placeablePlayer === false) return false;
+    try { if (!b.isVisible()) return false; } catch (e) {}
+    try { if (typeof b.isPlaceable === "function" && !b.isPlaceable()) return false; } catch (e) {}
+    try { if (typeof b.environmentBuildable === "function" && !b.environmentBuildable()) return false; } catch (e) {}
+    try { if (typeof b.supportsEnv === "function" && !b.supportsEnv(Vars.state.rules.env)) return false; } catch (e) {}
+
+    if (Vars.state.rules.infiniteResources || Vars.state.isEditor()) return true;
+    try {
+        if (typeof b.unlockedNowHost === "function") return b.unlockedNowHost();
+    } catch (e) {}
+    return b.unlockedNow();
+}
+
 function getBlocksInCategory(catIndex) {
     var cat = Category.all[Mathf.clamp(catIndex, 0, Category.all.length - 1)];
     var list = [];
     var blocks = Vars.content.blocks();
     for (var i = 0; i < blocks.size; i++) {
         var b = blocks.get(i);
-        if (b.category === cat && b.isVisible() && b.unlockedNow() && b.placeablePlayer !== false) {
+        if (b.category === cat && isBlockAvailable(b)) {
             list.push(b);
         }
     }
@@ -439,8 +455,6 @@ function setMode(m) {
     xHoldFrames = 0; copyArmed = false; copying = false;
     clipboard = null; pasteView = null;
     miningTile = null; nArmed = false; nDropped = false;
-    cArmed = false; cActed = false;
-    inspectBuild = null; inspectHoverItem = null;
 }
 
 function seqToArray(x) {
@@ -461,52 +475,23 @@ function sendUnitsCommand(player, units, buildTarget, unitTarget, pos) {
     if (units.size === 0) return;
     var ids = unitIds(units);
     try {
-        Call.commandUnits(player, ids, buildTarget, unitTarget, pos);
-    } catch (e1) {
+        Call.commandUnits(player, ids, buildTarget, unitTarget, pos, false, true);
+    } catch (e0) {
         try {
             Call.commandUnits(player, ids, buildTarget, unitTarget, pos, false);
-        } catch (e2) {
-            logOnce("commandUnits", e2);
+        } catch (e1) {
+            try {
+                Call.commandUnits(player, ids, buildTarget, unitTarget, pos);
+            } catch (e2) { logOnce("commandUnits", e2); }
         }
     }
+    try { Fx.commandSend.at(pos.x, pos.y); } catch (ef) {}
 }
-
-function cycleUnitMode(player, units) {
-    if (units.size === 0) return;
-    var first = units.get(0);
-    var opts = [];
-    var cmds = seqToArray(first.type.commands);
-    for (var i = 0; i < cmds.length; i++) opts.push({ kind: "cmd", obj: cmds[i] });
-    try {
-        var sts = seqToArray(first.type.stances);
-        for (var j = 0; j < sts.length; j++) opts.push({ kind: "stance", obj: sts[j] });
-    } catch (e) {}
-    if (opts.length === 0) return;
-
-    cmdCycleIndex = (cmdCycleIndex + 1) % opts.length;
-    var o = opts[cmdCycleIndex];
-    var ids = unitIds(units);
-    try {
-        if (o.kind === "cmd") {
-            Call.setUnitCommand(player, ids, o.obj);
-        } else {
-            try { Call.setUnitStance(player, ids, o.obj, true); }
-            catch (e3) { Call.setUnitStance(player, ids, o.obj); }
-        }
-        toast("[accent]Unit mode: [white]" + o.obj.localized());
-    } catch (e2) {
-        logOnce("unit mode change", e2);
-    }
-}
-
 function handleMenu(dt, capturing) {
     placing = false; removing = false; linePoints = null;
     copyArmed = false; copying = false;
-    cArmed = false; cActed = false;
-    inspectBuild = null; inspectHoverItem = null;
     nArmed = false; nDropped = false;
 
-    // Левый стик — курсор, правый стик — прокрутка (как колёсико мыши)
     var mx = applyDeadzone(pad.axes[AXIS_LX]);
     var my = -applyDeadzone(pad.axes[AXIS_LY]);
     moveCursor(mx, my, dt);
@@ -518,13 +503,11 @@ function handleMenu(dt, capturing) {
         try { scrollMenu(rsx, rsy, dt); } catch (e) { logOnce("menu scroll", e); }
     }
 
-    // Пока ждём назначения кнопки — клики и выход из меню отключены
     if (capturing) {
         if (uiMouseDown) updateMenuMouseClick(false);
         return;
     }
 
-    // Крестовина влево/вправо над ползунком — точная подстройка значения
     if (menuDpadCd > 0) menuDpadCd -= dt;
     var ddx = Math.round(pad.axes[AXIS_DPAD_X] || 0);
     if (ddx === 0) {
@@ -538,7 +521,6 @@ function handleMenu(dt, capturing) {
     if (justPressed(BTN_CIRCLE) || justPressed(BTN_L2) || justPressed(BTN_OPTIONS)) triggerEscape();
 }
 
-// --- поиск элемента под курсором, прокрутка и подстройка ползунков ---
 function elementUnderCursor() {
     var v = Core.scene.screenToStageCoordinates(new Vec2(Math.round(cursorX), sceneY()));
     return Core.scene.hit(v.x, v.y, true);
@@ -559,7 +541,6 @@ function scrollMenu(sx, sy, dt) {
         }
         el = el.parent;
     }
-    // Запасной вариант — обычное событие колёсика
     try { Core.scene.scrolled(dx * 0.02, dy * 0.02); } catch (e) {}
 }
 
@@ -575,6 +556,53 @@ function adjustSliderUnderCursor(dir) {
     return false;
 }
 
+var mapPanXField = null, mapPanYField = null, mapZoomField = null, mapFieldsInit = false;
+
+function handleMinimap(dt) {
+    var mf = Vars.ui.minimapfrag;
+    if (!mapFieldsInit && mf != null) {
+        mapFieldsInit = true;
+        mapPanXField = findField(mf.getClass(), "panx");
+        mapPanYField = findField(mf.getClass(), "pany");
+        mapZoomField = findField(mf.getClass(), "zoom");
+    }
+
+    // Повторное нажатие L3+R3 или Круг / Options закрывает карту
+    if ((isDown(BTN_L3) && justPressed(BTN_R3)) || (isDown(BTN_R3) && justPressed(BTN_L3)) ||
+        justPressed(BTN_CIRCLE) || justPressed(BTN_OPTIONS)) {
+        mf.hide();
+        suppressed[BTN_L3] = true;
+        suppressed[BTN_R3] = true;
+        return;
+    }
+
+    var curZoom = 1;
+    try { curZoom = Vars.renderer.minimap.getZoom(); } catch (e) {}
+
+    // Правый стик двигает саму карту
+    var rx = applyDeadzone(pad.axes[AXIS_RX]);
+    var ry = applyDeadzone(pad.axes[AXIS_RY]);
+    if ((rx !== 0 || ry !== 0) && mapPanXField != null && mapPanYField != null) {
+        try {
+            var px = mapPanXField.getFloat(mf);
+            var py = mapPanYField.getFloat(mf);
+            var step = (CAM_PAN_SPEED * 1.5 / Math.max(curZoom, 0.2)) * dt;
+            mapPanXField.setFloat(mf, px + rx * step);
+            mapPanYField.setFloat(mf, py + ry * step);
+        } catch (e1) { logOnce("map pan", e1); }
+    }
+
+    // L3 / R3 по отдельности приближают и отдаляют карту, а не камеру игрока
+    var zDir = (isDown(BTN_L3) ? 1 : 0) - (isDown(BTN_R3) ? 1 : 0);
+    if (zDir !== 0) {
+        try {
+            var nextZ = Mathf.clamp(curZoom * (1 + ZOOM_IN_SIGN * zDir * ZOOM_SPEED * dt * 0.5), 0.25, 16);
+            Vars.renderer.minimap.setZoom(nextZ);
+            if (mapZoomField != null) mapZoomField.setFloat(mf, nextZ);
+        } catch (e2) { logOnce("map zoom", e2); }
+    }
+}
+
 function handleGame(dt) {
     if (wasInUI) suppressAllHeld();
     if (uiMouseDown) updateMenuMouseClick(false);
@@ -586,6 +614,19 @@ function handleGame(dt) {
     var input = Vars.control.input;
 
     processPendingControl(player);
+
+    if (Vars.ui.minimapfrag != null) {
+        if (Vars.ui.minimapfrag.shown()) {
+            handleMinimap(dt);
+            return;
+        }
+        if ((isDown(BTN_L3) && justPressed(BTN_R3)) || (isDown(BTN_R3) && justPressed(BTN_L3))) {
+            Vars.ui.minimapfrag.toggle();
+            suppressed[BTN_L3] = true;
+            suppressed[BTN_R3] = true;
+            return;
+        }
+    }
 
     if (justPressed(BTN_OPTIONS)) { triggerEscape(); return; }
     if (justPressed(BTN_SHARE)) togglePause();
@@ -631,20 +672,47 @@ function panCamera(dpadX, dpadY, dt) {
     Core.camera.position.add(dpadX * step, dpadY * step);
 }
 
-// Вселение в турель / управляемый блок.
-// Сначала пробуем штатный вызов игры; если игра не переключила управление
-// (в одиночной игре) — переключаем напрямую через player.unit(blockUnit).
 function tryControlBuilding(player, unit, b) {
-    var can = false;
-    try { can = !!b.canControlSelect(unit); } catch (e) { can = false; }
-    var bu = null;
-    try { bu = b.unit(); } catch (e2) { bu = null; }
-    if (!can && bu == null) return false;
+    if (b == null || b.team !== player.team()) return false;
+    if (String(b.block.name).indexOf("core") === 0) return false;
 
     stopMining(unit);
-    try { Call.buildingControlSelect(player, b); } catch (e3) { logOnce("buildingControlSelect", e3); }
-    pendingCtl = { b: b, t: 0 };
-    return true;
+
+    // 1. Все турели, маршрутизаторы и блоки с поддержкой ControlBlock
+    try {
+        var m = b.getClass().getMethod("unit");
+        var bu = m.invoke(b);
+        if (bu != null) {
+            if (unit === bu) return false; // уже сидим в этом блоке — выходим в ядро
+            Call.unitControl(player, bu);
+            toast("[accent]Управление: [white]" + b.block.localizedName);
+            return true;
+        }
+    } catch (e1) {}
+
+    // 2. Фабрики юнитов / реконструкторы
+    try {
+        if (unit != null && b.canControlSelect(unit)) {
+            Call.buildingControlSelect(player, b);
+            toast("[accent]Управление: [white]" + b.block.localizedName);
+            return true;
+        }
+    } catch (e2) {}
+
+    // 3. Любые другие блоки (конвейеры, буры, стены и т.д.) — БЕЗ bu.add(), чтобы не было ohno
+    if (!Vars.net.client()) {
+        try {
+            if (unit != null && unit.type === UnitTypes.block && unit.tile === b) return false;
+            var customBu = UnitTypes.block.create(b.team);
+            customBu.tile = b;
+            customBu.set(b.x, b.y);
+            customBu.health = b.health;
+            player.unit(customBu);
+            toast("[accent]Управление: [white]" + b.block.localizedName);
+            return true;
+        } catch (e3) { logOnce("force possess", e3); }
+    }
+    return false;
 }
 
 function processPendingControl(player) {
@@ -654,45 +722,114 @@ function processPendingControl(player) {
     var pb = pendingCtl.b;
     pendingCtl = null;
     try {
-        if (!pb.isValid() || player.dead()) return;
+        if (!pb.isValid()) return;
         var bu = pb.unit();
         if (bu == null) return;
         if (player.unit() === bu) {
             toast("[accent]Управление: [white]" + pb.block.localizedName);
             return;
         }
-        if (Vars.net.active()) { toast("[scarlet]Не удалось вселиться в " + pb.block.localizedName); return; }
-        var okCtl = true;
-        try { if (typeof pb.canControl === "function") okCtl = !!pb.canControl(); } catch (e0) {}
-        if (!okCtl) { toast("[scarlet]Эта турель не поддаётся ручному управлению"); return; }
+        if (Vars.net.active()) {
+            try { Call.unitControl(player, bu); } catch (en) {}
+            return;
+        }
+        if (!canPossessBuilding(player.unit(), pb)) return;
         player.unit(bu);
         toast("[accent]Управление: [white]" + pb.block.localizedName);
     } catch (e) { logOnce("control fallback", e); }
 }
 
+// Штатное открытие плашки ресурсов (inv) и конфигурации (config) как при обычном ЛКМ
+function tileTappedWorld(player, b) {
+    var input = Vars.control.input;
+    if (b == null) {
+        try { input.inv.hide(); } catch (e1) {}
+        try { input.config.hideConfig(); } catch (e2) {}
+        return false;
+    }
+    var consumed = false, showedInv = false;
+
+    try {
+        if (b.block.configurable && b.interactable(player.team())) {
+            consumed = true;
+            if ((!input.config.isShown() && b.shouldShowConfigure(player)) ||
+                (input.config.isShown() && input.config.getSelected() != null && input.config.getSelected().onConfigureBuildTapped(b))) {
+                try { Sounds.click.at(b); } catch (es) {}
+                input.config.showConfig(b);
+            }
+        } else if (!input.config.hasConfigMouse()) {
+            if (input.config.isShown() && input.config.getSelected() != null && input.config.getSelected().onConfigureBuildTapped(b)) {
+                consumed = true;
+            } else {
+                input.config.hideConfig();
+            }
+        }
+    } catch (e3) { logOnce("config tap", e3); }
+
+    try {
+        if (b.block.hasItems && b.items != null && b.items.total() > 0 &&
+            b.interactable(player.team()) && !input.inv.isShown() &&
+            b.block.itemCapacity > 0 && b.block.unloadable) {
+            input.inv.showFor(b);
+            consumed = true;
+            showedInv = true;
+        }
+        if (!showedInv) input.inv.hide();
+    } catch (e4) { logOnce("inv tap", e4); }
+
+    return consumed;
+}
+
+// Короткое нажатие X: клик по открытой плашке ресурсов/фабрики или открытие плашки/копка
 function tapAction(player, unit, wx, wy) {
-    var target = Units.closest(player.team(), wx, wy, 30, function (u) {
-        return !u.isPlayer() && u.type.playerControllable && !u.dead;
-    });
-    if (target != null) {
-        stopMining(unit);
-        Call.unitControl(player, target);
+    if (elementUnderCursor() != null) {
+        clickSceneAtCursor();
         return;
     }
+
+    var input = Vars.control.input;
+    try {
+        if (input.config.isShown() && input.config.getSelected() != null) {
+            if (input.config.getSelected().onConfigureTapped(wx, wy)) return;
+        }
+    } catch (e) {}
+
     var b = Vars.world.buildWorld(wx, wy);
-    if (b != null && b.team === player.team() && unit != null) {
-        if (tryControlBuilding(player, unit, b)) return;
-    }
+    if (tileTappedWorld(player, b)) return;
+
     var ore = Vars.world.tileWorld(wx, wy);
-    if (unit && ore != null && ore.block() === Blocks.air && ore.drop() != null) {
-        if (!tryStartMining(unit, ore)) toast("[scarlet]Cannot mine here (too far or incompatible unit)");
+    if (unit && ore != null && ((ore.block() === Blocks.air && ore.drop() != null) || ore.wallDrop() != null)) {
+        if (!tryStartMining(unit, ore)) toast("[scarlet]Нельзя копать здесь (далеко или юнит не умеет)");
     } else {
         stopMining(unit);
     }
 }
 
+// Нажатие Circle: вселиться в юнита/турель/маршрутизатор или возродиться из ядра
+function circleAction(player, unit, wx, wy) {
+    var target = Units.closest(player.team(), wx, wy, 12, function (u) {
+        return !u.isPlayer() && u.type.playerControllable && !u.dead && u.within(wx, wy, u.hitSize * 0.7 + 2);
+    });
+    if (target != null) {
+        stopMining(unit);
+        Call.unitControl(player, target);
+        toast("[accent]Управление: [white]" + target.type.localizedName);
+        return;
+    }
+
+    var b = Vars.world.buildWorld(wx, wy);
+    if (b != null && b.team === player.team()) {
+        if (tryControlBuilding(player, unit, b)) return;
+    }
+
+    stopMining(unit);
+    try { Vars.control.input.inv.hide(); } catch (e1) {}
+    try { Vars.control.input.config.hideConfig(); } catch (e2) {}
+    Call.unitClear(player);
+}
+
 function dropItems(player, unit, wx, wy) {
-    if (!unit || unit.stack.amount <= 0) { toast("[lightgray]Unit has no items"); return; }
+    if (!unit || unit.stack.amount <= 0) { toast("[lightgray]У юнита нет предметов"); return; }
     var st = unit.stack;
     var b = Vars.world.buildWorld(wx, wy);
     var canGive = false;
@@ -703,90 +840,14 @@ function dropItems(player, unit, wx, wy) {
         } catch (e) { canGive = false; }
     }
     if (canGive) {
-        var range = Vars.itemTransferRange;
-        if (range === undefined) range = 24;
-        if (!unit.within(b, range)) { toast("[scarlet]Too far"); return; }
+        var range = (Vars.itemTransferRange !== undefined) ? Vars.itemTransferRange : 220;
+        if (!unit.within(b, range)) { toast("[scarlet]Слишком далеко"); return; }
         Call.transferInventory(player, b);
-        toast("[accent]Items transferred: [white]" + b.block.localizedName);
+        toast("[accent]Передано в: [white]" + b.block.localizedName);
     } else {
         Call.dropItem(player.angleTo(wx, wy));
-        toast("[accent]Items dropped");
+        toast("[accent]Предметы выброшены");
     }
-}
-
-function getInspectItems(b) {
-    var out = [];
-    if (b == null || !b.isValid() || b.items == null || !b.block.hasItems) return out;
-    var all = Vars.content.items();
-    for (var i = 0; i < all.size; i++) {
-        var it = all.get(i);
-        var amt = b.items.get(it);
-        if (amt > 0) out.push({ item: it, amount: amt });
-    }
-    return out;
-}
-
-function updateInspectHover() {
-    inspectHoverItem = null;
-    if (inspectBuild == null) return;
-    var list = getInspectItems(inspectBuild);
-    if (list.length === 0) return;
-
-    var topY = Math.round(Core.graphics.getHeight() * 0.65);
-    for (var i = 0; i < list.length; i++) {
-        var ry = topY - (i + 1) * (PANEL_ROW_H + PANEL_GAP);
-        if (cursorX >= PANEL_X && cursorX <= PANEL_X + PANEL_W &&
-            cursorY >= ry && cursorY <= ry + PANEL_ROW_H) {
-            inspectHoverItem = list[i].item;
-            return;
-        }
-    }
-}
-
-function openInspectAt(player, unit, wx, wy) {
-    var b = Vars.world.buildWorld(wx, wy);
-    if (b == null || !b.interactable(player.team()) || !b.block.hasItems || b.items == null) {
-        inspectBuild = null;
-        toast("[lightgray]No storage/building with items under cursor");
-        return;
-    }
-    var range = (Vars.itemTransferRange !== undefined) ? Vars.itemTransferRange : 220;
-    if (unit && !unit.within(b, range)) {
-        toast("[scarlet]Too far");
-        return;
-    }
-    if (getInspectItems(b).length === 0) {
-        inspectBuild = null;
-        toast("[lightgray]Building is empty: [white]" + b.block.localizedName);
-        return;
-    }
-    inspectBuild = b;
-    toast("[accent]Contents: [white]" + b.block.localizedName);
-}
-
-function takeFromInspect(player, unit, b, item) {
-    if (!unit) return;
-    if (b == null || !b.isValid() || b.items == null || b.items.get(item) <= 0) {
-        toast("[scarlet]This item is no longer available");
-        return;
-    }
-    var range = (Vars.itemTransferRange !== undefined) ? Vars.itemTransferRange : 220;
-    if (!unit.within(b, range)) {
-        toast("[scarlet]Too far");
-        return;
-    }
-    var maxFit = unit.maxAccepted(item);
-    if (maxFit <= 0) {
-        if (unit.stack.amount > 0 && unit.stack.item !== item) {
-            toast("[scarlet]Drop " + unit.stack.item.localizedName + " first (hold X)");
-        } else {
-            toast("[lightgray]Unit inventory is full");
-        }
-        return;
-    }
-    var toTake = Math.min(b.items.get(item), maxFit);
-    Call.requestItem(player, b, item, toTake);
-    toast("[accent]Taken: [white]" + item.localizedName + " x" + toTake);
 }
 
 function stopMining(unit) {
@@ -801,7 +862,7 @@ function tryStartMining(unit, tile) {
         ok = input.canMine(tile);
     } catch (e) {
         try {
-            ok = tile.drop() != null && unit.canMine() && unit.validMine(tile) && tile.block() === Blocks.air;
+            ok = (tile.drop() != null || tile.wallDrop() != null) && unit.canMine() && unit.validMine(tile);
         } catch (e2) { ok = false; }
     }
     if (!ok) return false;
@@ -819,25 +880,21 @@ function normalMode(player, unit, alive, wx, wy, dpadX, dpadY, dt) {
             miningTile = null;
         } else {
             var stillOk = false;
-            try {
-                stillOk = unit.validMine(miningTile) && miningTile.drop() != null && miningTile.block() === Blocks.air;
-            } catch (e) {}
+            try { stillOk = unit.validMine(miningTile); } catch (e) {}
             if (!stillOk) stopMining(unit);
             else if (unit.mineTile == null) unit.mineTile = miningTile;
         }
     }
 
-    if (justPressed(BTN_CROSS) && alive) {
+    if (justPressed(BTN_CROSS)) {
         nArmed = true; nHold = 0; nDropped = false;
     }
     if (nArmed) {
-        if (!alive) {
-            nArmed = false;
-        } else if (isDown(BTN_CROSS)) {
+        if (isDown(BTN_CROSS)) {
             nHold += dt;
             if (nHold >= HOLD_FRAMES && !nDropped) {
                 nDropped = true;
-                dropItems(player, unit, wx, wy);
+                if (alive) dropItems(player, unit, wx, wy);
             }
         } else {
             nArmed = false;
@@ -845,49 +902,13 @@ function normalMode(player, unit, alive, wx, wy, dpadX, dpadY, dt) {
         }
     }
 
-    if (inspectBuild != null) {
-        var rRange = (Vars.itemTransferRange !== undefined) ? Vars.itemTransferRange : 220;
-        if (!alive || !unit || !inspectBuild.isValid() ||
-            !inspectBuild.interactable(player.team()) || !unit.within(inspectBuild, rRange)) {
-            inspectBuild = null;
-            inspectHoverItem = null;
-        }
-    }
-    updateInspectHover();
-
-    if (justPressed(BTN_CIRCLE) && alive) {
-        cArmed = true; cHold = 0; cActed = false;
-    }
-    if (cArmed) {
-        if (!alive) {
-            cArmed = false;
-        } else if (isDown(BTN_CIRCLE)) {
-            cHold += dt;
-            if (cHold >= HOLD_FRAMES && !cActed) {
-                cActed = true;
-                if (inspectBuild != null && inspectHoverItem != null) {
-                    takeFromInspect(player, unit, inspectBuild, inspectHoverItem);
-                } else {
-                    openInspectAt(player, unit, wx, wy);
-                }
-            }
-        } else {
-            cArmed = false;
-            if (!cActed) {
-                if (inspectBuild != null) {
-                    inspectBuild = null;
-                    inspectHoverItem = null;
-                    toast("[lightgray]Panel closed");
-                } else {
-                    Call.unitClear(player);
-                }
-            }
-        }
+    if (justPressed(BTN_CIRCLE)) {
+        circleAction(player, unit, wx, wy);
     }
 
     if (justPressed(BTN_SQUARE)) {
         if (Vars.state.isCampaign()) Vars.ui.research.show();
-        else toast("[scarlet]Research is only available in campaign");
+        else toast("[scarlet]Исследования доступны только в кампании");
     }
 
     if (justPressed(BTN_TRIANGLE)) {
@@ -912,14 +933,14 @@ function buildMode(player, unit, alive, wx, wy, dpadX, dpadY, dt) {
 
     if (justPressed(BTN_TRIANGLE)) {
         buildSubMode = "category";
-        toast("[accent]Select category");
+        toast("[accent]Выбор категории");
     }
     if (justPressed(BTN_SQUARE)) {
         if (buildSubMode === "block") {
             input.rotation = (input.rotation + 1) % 4;
         } else {
             buildSubMode = "block";
-            toast("[accent]Select block");
+            toast("[accent]Выбор блока");
         }
         updateSelectedBlock();
     }
@@ -928,11 +949,19 @@ function buildMode(player, unit, alive, wx, wy, dpadX, dpadY, dt) {
     if ((dpadX !== 0 || dpadY !== 0) && dpadCooldown <= 0) {
         dpadCooldown = 10;
         if (buildSubMode === "category") {
-            var total = Category.all.length;
-            var step = ((dpadX !== 0) ? dpadX : -dpadY) > 0 ? 1 : -1;
-            for (var k = 0; k < total; k++) {
-                selectedCatIndex = (selectedCatIndex + step + total) % total;
-                if (getBlocksInCategory(selectedCatIndex).length > 0) break;
+            var catCols = 2; // Категории в интерфейсе идут в 2 столбца
+            var totalCats = Category.all.length;
+            var cRow = Math.floor(selectedCatIndex / catCols);
+            var cCol = selectedCatIndex % catCols;
+
+            if (dpadX !== 0) {
+                var nextCol = Mathf.clamp(cCol + dpadX, 0, catCols - 1);
+                var candX = cRow * catCols + nextCol;
+                if (candX < totalCats) selectedCatIndex = candX;
+            }
+            if (dpadY !== 0) {
+                var candY = selectedCatIndex + (-dpadY * catCols);
+                if (candY >= 0 && candY < totalCats) selectedCatIndex = candY;
             }
             selectedBlockIndex = 0;
             syncCategoryUI();
@@ -940,8 +969,19 @@ function buildMode(player, unit, alive, wx, wy, dpadX, dpadY, dt) {
         } else {
             var blocks = getBlocksInCategory(selectedCatIndex);
             if (blocks.length > 0) {
-                var delta = dpadX + (-dpadY * 4);
-                selectedBlockIndex = (selectedBlockIndex + delta + blocks.length * 4) % blocks.length;
+                var blkCols = 4; // Блоки идут по 4 в ряд
+                var bRow = Math.floor(selectedBlockIndex / blkCols);
+                var bCol = selectedBlockIndex % blkCols;
+
+                if (dpadX !== 0) {
+                    var maxCol = Math.min(blkCols - 1, blocks.length - 1 - bRow * blkCols);
+                    var nextBCol = Mathf.clamp(bCol + dpadX, 0, maxCol);
+                    selectedBlockIndex = bRow * blkCols + nextBCol;
+                }
+                if (dpadY !== 0) {
+                    var candBY = selectedBlockIndex + (-dpadY * blkCols);
+                    if (candBY >= 0 && candBY < blocks.length) selectedBlockIndex = candBY;
+                }
                 updateSelectedBlock();
             }
         }
@@ -969,7 +1009,7 @@ function buildMode(player, unit, alive, wx, wy, dpadX, dpadY, dt) {
             }
             if (justPressed(BTN_CIRCLE)) {
                 placing = false; linePoints = null; circleConsumed = true;
-                toast("[lightgray]Placement cancelled");
+                toast("[lightgray]Строительство отменено");
             } else if (!isDown(BTN_R2)) {
                 for (var j = 0; j < linePoints.length; j++) {
                     var q = linePoints[j];
@@ -1011,14 +1051,14 @@ function buildMode(player, unit, alive, wx, wy, dpadX, dpadY, dt) {
             }
             if (okCount > 0) input.isBuilding = true;
             pasteLastTX = -9999;
-            toast("[accent]Placed: [white]" + okCount + " of " + pasteView.length);
+            toast("[accent]Размещено: [white]" + okCount + " из " + pasteView.length);
         }
     }
 
     if (justPressed(BTN_CROSS)) {
         if (placing || removing) {
             placing = false; linePoints = null; removing = false;
-            toast("[lightgray]Cancelled");
+            toast("[lightgray]Отменено");
         } else {
             copyArmed = true; copying = false; xHoldFrames = 0;
             copyStartX = tx; copyStartY = ty; copyEndX = tx; copyEndY = ty;
@@ -1047,14 +1087,14 @@ function cancelAll(unit) {
     var input = Vars.control.input;
     if (clipboard != null) {
         clipboard = null; pasteView = null;
-        toast("[lightgray]Clipboard cleared");
+        toast("[lightgray]Буфер обмена очищен");
         return;
     }
     var hadPlans = unit && unit.plans.size > 0;
     if (unit) unit.clearBuilding();
     try { input.selectPlans.clear(); } catch (e) {}
     if (!hadPlans) input.block = null;
-    toast("[accent]Cancelled");
+    toast("[accent]Отменено");
 }
 
 function buildPasteView(player, tx, ty) {
@@ -1113,7 +1153,7 @@ function commitRemove(player, unit, x1, y1, x2, y2) {
 function copyBlockAt(player, tileX, tileY) {
     var input = Vars.control.input;
     var tb = Vars.world.build(tileX, tileY);
-    if (tb == null || tb.team !== player.team() || !tb.block.unlockedNow()) return;
+    if (tb == null || tb.team !== player.team() || !isBlockAvailable(tb.block)) return;
 
     var blk = tb.block, rot = tb.rotation;
     selectedCatIndex = blk.category.ordinal();
@@ -1125,7 +1165,7 @@ function copyBlockAt(player, tileX, tileY) {
     input.block = blk;
     input.rotation = rot;
     if (blk.configurable) blk.lastConfig = tb.config();
-    toast("[accent]Copied: [white]" + blk.localizedName);
+    toast("[accent]Скопировано: [white]" + blk.localizedName);
 }
 
 function copyArea(player, x1, y1, x2, y2) {
@@ -1143,30 +1183,29 @@ function copyArea(player, x1, y1, x2, y2) {
             if (seen[key]) continue;
             seen[key] = true;
             var blk = b.block;
-            if (b.team !== player.team() || !blk.isVisible() || !blk.unlockedNow() || blk.rebuildable === false) continue;
+            if (b.team !== player.team() || !isBlockAvailable(blk) || blk.rebuildable === false) continue;
             list.push({
                 dx: b.tile.x - ax, dy: b.tile.y - ay, rot: b.rotation,
                 block: blk, config: blk.configurable ? b.config() : null
             });
         }
     }
-    if (list.length === 0) { toast("[scarlet]Nothing to copy in area"); return; }
+    if (list.length === 0) { toast("[scarlet]Нечего копировать в выбранной области"); return; }
 
     clipboard = list;
     pasteView = null;
     pasteLastTX = -9999;
     Vars.control.input.block = null;
-    toast("[accent]Copied buildings: [white]" + list.length + "[accent]. R2 - paste, X - clear");
+    toast("[accent]Скопировано построек: [white]" + list.length + "[accent]. R2 — вставить, X — очистить");
 }
 
 function commandMode(player, unit, wx, wy, dpadX, dpadY, dt) {
     var input = Vars.control.input;
     var sel = input.selectedUnits;
     player.shooting = false;
-    try { input.commandMode = true; } catch (e) {}
+    input.commandMode = true;
 
-    // Крестовина — перемещение по панели команд / стоек
-    var pdata = cmdPanelData(sel);
+    var pdata = cmdPanelData();
     cmdPanelNav(pdata, dpadX, dpadY, dt);
 
     if (justPressed(BTN_R2)) {
@@ -1177,6 +1216,7 @@ function commandMode(player, unit, wx, wy, dpadX, dpadY, dt) {
             var u = Units.closest(player.team(), wx, wy, 24, function (x) { return x.isCommandable(); });
             if (u != null) {
                 if (sel.contains(u)) sel.remove(u); else sel.add(u);
+                try { Events.fire(Trigger.unitCommandChange); } catch (e0) {}
             }
         } else {
             var minX = Math.min(cmdStartX, wx), maxX = Math.max(cmdStartX, wx);
@@ -1186,6 +1226,7 @@ function commandMode(player, unit, wx, wy, dpadX, dpadY, dt) {
                 if (x.team === player.team() && x.isCommandable() &&
                     x.x >= minX && x.x <= maxX && x.y >= minY && x.y <= maxY) sel.add(x);
             });
+            try { Events.fire(Trigger.unitCommandChange); } catch (e1) {}
         }
     }
 
@@ -1199,6 +1240,7 @@ function commandMode(player, unit, wx, wy, dpadX, dpadY, dt) {
     if (justPressed(BTN_CIRCLE)) {
         sel.clear();
         try { input.commandBuildings.clear(); } catch (e2) {}
+        try { Events.fire(Trigger.unitCommandChange); } catch (e3) {}
     }
 
     if (justPressed(BTN_TRIANGLE)) {
@@ -1206,9 +1248,9 @@ function commandMode(player, unit, wx, wy, dpadX, dpadY, dt) {
         Groups.unit.each(function (x) {
             if (x.team === player.team() && x.isCommandable()) sel.add(x);
         });
+        try { Events.fire(Trigger.unitCommandChange); } catch (e4) {}
     }
 
-    // Квадрат — выбрать / отменить пункт панели под курсором-рамкой
     if (justPressed(BTN_SQUARE)) cmdPanelActivate(player, sel, pdata);
 }
 
@@ -1354,7 +1396,6 @@ function openCtrlSettings() {
     } catch (e) { logOnce("open controller settings", e); }
 }
 
-// --- назначение кнопки (прямо в строке, курсор при этом продолжает работать) ---
 function bindingLabel(key) {
     for (var i = 0; i < BIND_DEFS.length; i++) if (BIND_DEFS[i].key === key) return BIND_DEFS[i].label.split(":")[0];
     return key;
@@ -1406,7 +1447,6 @@ function bindButton(key, idx) {
     if (swapped != null) toast("[accent]" + bindingLabel(swapped) + " получила " + physName(old));
 }
 
-// Возвращает true, пока идёт ожидание нажатия.
 function captureTick() {
     if (capKey == null) return false;
     var now = java.lang.System.currentTimeMillis();
@@ -1439,7 +1479,6 @@ function captureTick() {
     return true;
 }
 
-// --- вставка кнопки в меню настроек сразу после «Управление» ---
 function cellText(a) {
     try { return String(a.getText()); } catch (e) { return null; }
 }
@@ -1524,182 +1563,149 @@ function uiTick() {
 }
 
 // ---------------------------------------------------------------------------
-//  Панель «Режим командования» (всегда видна в режиме командования)
+//  Панель «Режим командования»
 // ---------------------------------------------------------------------------
-function cmdPanelData(sel) {
-    var first = (sel.size > 0) ? sel.get(0) : null;
-    var d = { first: first, count: sel.size, cmds: [], stances: [] };
-    if (first != null) {
-        try { d.cmds = seqToArray(first.type.commands); } catch (e) {}
-        try { d.stances = seqToArray(first.type.stances); } catch (e2) {}
-    }
-    return d;
+var JButton = Packages.arc.scene.ui.Button;
+var elemVisField = null;
+
+function isElemVisible(el) {
+    if (el == null) return false;
+    try {
+        if (elemVisField == null) {
+            var c = el.getClass();
+            while (c != null) {
+                try {
+                    var f = c.getDeclaredField("visible");
+                    f.setAccessible(true);
+                    elemVisField = f;
+                    break;
+                } catch (e0) {}
+                c = c.getSuperclass();
+            }
+        }
+        if (elemVisField != null) return Boolean(elemVisField.getBoolean(el));
+    } catch (e) {}
+    return true;
 }
 
-function cmdPanelClamp(data) {
-    var rows = [data.cmds, data.stances];
-    if (rows[cmdRow].length === 0 && rows[1 - cmdRow].length > 0) cmdRow = 1 - cmdRow;
-    var n = rows[cmdRow].length;
-    cmdCol = (n === 0) ? 0 : Mathf.clamp(cmdCol, 0, n - 1);
-}
-
-function cmdPanelNav(data, dpadX, dpadY, dt) {
-    if (dpadCooldown > 0) dpadCooldown -= dt;
-    if (dpadX === 0 && dpadY === 0) { dpadCooldown = 0; return; }
-    if (dpadCooldown > 0) return;
-    dpadCooldown = 10;
-
-    cmdPanelClamp(data);
-    var rows = [data.cmds, data.stances];
-    if (dpadY !== 0) {
-        var other = 1 - cmdRow;
-        if (rows[other].length > 0) cmdRow = other;
-    }
-    if (dpadX !== 0) {
-        var n = rows[cmdRow].length;
-        if (n > 0) cmdCol = (cmdCol + dpadX + n) % n;
-    }
-    cmdPanelClamp(data);
-}
-
-function cmdItemName(o) {
-    try { return String(o.localized()); } catch (e) { return String(o.name); }
-}
-
-function cmdItemIcon(o) {
-    try { var ic = o.getIcon(); if (ic != null) return ic; } catch (e) {}
-    try { var ic2 = JIcon.icons.get(o.icon); if (ic2 != null) return ic2; } catch (e2) {}
+function findCmdHeaderLabel(el, title) {
+    if (!isElemVisible(el)) return null;
+    if (cellText(el) === title) return el;
+    try {
+        var ch = el.getChildren();
+        for (var i = 0; i < ch.size; i++) {
+            var found = findCmdHeaderLabel(ch.get(i), title);
+            if (found != null) return found;
+        }
+    } catch (e) {}
     return null;
 }
 
-function isCmdActive(first, obj) {
-    if (first == null) return false;
+function findCmdPanelRoot() {
     try {
-        var c = first.controller();
-        if (c.command !== undefined) return c.command === obj;
-    } catch (e) {}
-    return cmdLocalCmd === obj;
-}
-
-function isStanceActive(first, st) {
-    if (first == null) return false;
-    try {
-        var c = first.controller();
-        if (typeof c.hasStance === "function") return !!c.hasStance(st);
-    } catch (e) {}
-    try {
-        var c2 = first.controller();
-        if (c2.stances != null && typeof c2.stances.contains === "function") return !!c2.stances.contains(st);
-    } catch (e2) {}
-    return !!stanceLocal[String(st.name)];
-}
-
-function cmdPanelActivate(player, sel, data) {
-    cmdPanelClamp(data);
-    var row = (cmdRow === 0) ? data.cmds : data.stances;
-    if (sel.size === 0 || row.length === 0) { toast("[lightgray]Сначала выберите юнитов (R2 / △)"); return; }
-    var obj = row[cmdCol];
-    var ids = unitIds(sel);
-    try {
-        if (cmdRow === 0) {
-            var target = obj;
-            if (isCmdActive(data.first, obj)) {
-                // «Отмена» команды — возвращаем обычное перемещение
-                var def = null;
-                try { def = UnitCommand.moveCommand; } catch (e0) {}
-                if (def == null && data.cmds.length > 0) def = data.cmds[0];
-                if (def != null) target = def;
+        var title = String(Core.bundle.get("commandmode.name"));
+        var lbl = findCmdHeaderLabel(Vars.ui.hudGroup, title);
+        if (lbl != null) {
+            var p = lbl.parent;
+            while (p != null && p.parent != null && p.parent !== Vars.ui.hudGroup) {
+                p = p.parent;
             }
-            Call.setUnitCommand(player, ids, target);
-            cmdLocalCmd = target;
-            toast((target === obj ? "[accent]Команда: [white]" : "[lightgray]Отмена, команда: [white]") + cmdItemName(target));
-        } else {
-            var on = !isStanceActive(data.first, obj);
-            try { Call.setUnitStance(player, ids, obj, on); }
-            catch (e1) { Call.setUnitStance(player, ids, obj); }
-            stanceLocal[String(obj.name)] = on;
-            toast((on ? "[accent]Стойка включена: [white]" : "[lightgray]Стойка отключена: [white]") + cmdItemName(obj));
+            return p;
         }
-    } catch (e) { logOnce("cmd panel activate", e); }
+    } catch (e) {}
+    return null;
 }
 
-function drawCommandPanel(w, h) {
-    var sel = Vars.control.input.selectedUnits;
-    var data = cmdPanelData(sel);
-    cmdPanelClamp(data);
-
-    var ITEM = 46, GAP = 6, PAD = 12;
-    var nMax = Math.max(data.cmds.length, data.stances.length, 4);
-    var pw = Math.max(340, PAD * 2 + nMax * (ITEM + GAP) - GAP);
-    var ph = 262;
-    var px = 20, py = Math.round(h * 0.55) - ph;
-    var f = Fonts.outline;
-
-    Draw.color(0, 0, 0, 0.78);
-    Fill.rect(px + pw / 2, py + ph / 2, pw, ph);
-    Lines.stroke(2, Pal.accent);
-    Lines.rect(px, py, pw, ph);
-    Draw.reset();
-
-    var y = py + ph - PAD;
-    f.draw("[accent]Режим командования", px + pw / 2, y, Align.center);
-    y -= 28;
-    Lines.stroke(2, Pal.accent);
-    Lines.line(px + PAD, y, px + pw - PAD, y);
-    Draw.reset();
-    y -= 8;
-
-    if (data.first != null) {
-        try { Draw.rect(data.first.type.uiIcon, px + PAD + 18, y - 18, 32, 32); } catch (e) {}
-        Draw.reset();
-        f.draw("[white]Выбрано: " + data.count, px + PAD + 44, y - 10, Align.left);
-    } else {
-        f.draw("[scarlet]Нет выбранных юнитов", px + PAD, y - 10, Align.left);
-    }
-    y -= 40;
-
-    var labels = ["Команды", "Стойки"];
-    var rows = [data.cmds, data.stances];
-    for (var r = 0; r < 2; r++) {
-        f.draw("[lightgray]" + labels[r], px + PAD, y, Align.left);
-        y -= 18;
-        var items = rows[r];
-        for (var i = 0; i < items.length; i++) {
-            var o = items[i];
-            var ix = px + PAD + i * (ITEM + GAP), iy = y - ITEM;
-            var focused = (cmdRow === r && cmdCol === i);
-            var on = (r === 0) ? isCmdActive(data.first, o) : isStanceActive(data.first, o);
-
-            Draw.color(0.08, 0.08, 0.08, 0.95);
-            Fill.rect(ix + ITEM / 2, iy + ITEM / 2, ITEM, ITEM);
-            if (on) {
-                Draw.color(Pal.accent, 0.35);
-                Fill.rect(ix + ITEM / 2, iy + ITEM / 2, ITEM, ITEM);
+function collectCmdButtons(el, out, sx, sy, limitArea) {
+    if (!isElemVisible(el)) return;
+    if (el instanceof JButton) {
+        var w = el.getWidth() * sx, h = el.getHeight() * sy;
+        if (w > 10 && h > 10) {
+            var p = el.localToStageCoordinates(Tmp.v1.set(0, 0));
+            var bx = p.x * sx, by = p.y * sy;
+            if (!limitArea || (bx < Core.graphics.getWidth() * 0.45 && by < Core.graphics.getHeight() * 0.55)) {
+                out.push({ btn: el, x: bx, y: by, w: w, h: h });
             }
-            Draw.reset();
-
-            var ic = cmdItemIcon(o);
-            if (ic != null) {
-                try { Draw.color(Color.white); ic.draw(ix + 8, iy + 8, ITEM - 16, ITEM - 16); } catch (e1) {}
-                Draw.reset();
-            } else {
-                f.draw("[white]" + cmdItemName(o).substring(0, 3), ix + ITEM / 2, iy + ITEM / 2 + 6, Align.center);
-            }
-
-            Lines.stroke(focused ? 3 : 1, focused ? Pal.accent : Color.gray);
-            Lines.rect(ix, iy, ITEM, ITEM);
-            Draw.reset();
         }
-        y -= ITEM + 8;
+        return;
     }
+    try {
+        var ch = el.getChildren();
+        for (var i = 0; i < ch.size; i++) collectCmdButtons(ch.get(i), out, sx, sy, limitArea);
+    } catch (e) {}
+}
 
-    var fr = (cmdRow === 0) ? data.cmds : data.stances;
-    if (data.count === 0) {
-        f.draw("[lightgray]Выберите юнитов: R2 или △ (всех)", px + PAD, y, Align.left);
-    } else {
-        var nm = (fr.length > 0) ? "[accent]" + cmdItemName(fr[cmdCol]) + "  " : "";
-        f.draw(nm + "[lightgray]□ — выбрать/отмена", px + PAD, y, Align.left);
+function cmdPanelData() {
+    var raw = [];
+    try {
+        var sx = Core.graphics.getWidth() / Math.max(1, Core.scene.getWidth());
+        var sy = Core.graphics.getHeight() / Math.max(1, Core.scene.getHeight());
+        var root = findCmdPanelRoot();
+        if (root != null) collectCmdButtons(root, raw, sx, sy, false);
+        else collectCmdButtons(Vars.ui.hudGroup, raw, sx, sy, true);
+    } catch (e) {}
+
+    raw.sort(function (a, b) { return b.y - a.y; }); // ряды сверху вниз
+    var rows = [];
+    for (var i = 0; i < raw.length; i++) {
+        var it = raw[i];
+        var placed = false;
+        for (var r = 0; r < rows.length; r++) {
+            if (Math.abs(rows[r][0].y - it.y) < 14) {
+                rows[r].push(it);
+                placed = true;
+                break;
+            }
+        }
+        if (!placed) rows.push([it]);
     }
+    for (var k = 0; k < rows.length; k++) {
+        rows[k].sort(function (a, b) { return a.x - b.x; }); // кнопки слева направо
+    }
+    return rows;
+}
+
+function cmdPanelClamp(rows) {
+    if (rows.length === 0) { cmdRow = 0; cmdCol = 0; return; }
+    cmdRow = Mathf.clamp(cmdRow, 0, rows.length - 1);
+    cmdCol = Mathf.clamp(cmdCol, 0, rows[cmdRow].length - 1);
+}
+
+function cmdPanelNav(rows, dpadX, dpadY, dt) {
+    if (dpadCooldown > 0) dpadCooldown -= dt;
+    if (dpadX === 0 && dpadY === 0) { dpadCooldown = 0; return; }
+    if (dpadCooldown > 0 || rows.length === 0) return;
+    dpadCooldown = 10;
+
+    cmdPanelClamp(rows);
+    if (dpadY !== 0) cmdRow = Mathf.clamp(cmdRow - dpadY, 0, rows.length - 1);
+    cmdPanelClamp(rows);
+    if (dpadX !== 0) cmdCol = Mathf.clamp(cmdCol + dpadX, 0, rows[cmdRow].length - 1);
+}
+
+function cmdPanelActivate(player, sel, rows) {
+    cmdPanelClamp(rows);
+    if (rows.length === 0 || rows[cmdRow].length === 0) return;
+    var f = rows[cmdRow][cmdCol];
+    try {
+        var cx = Math.round(f.x + f.w / 2);
+        var cy = Math.round(f.y + f.h / 2);
+        var sy = SCENE_FLIP_Y ? (Core.graphics.getHeight() - 1 - cy) : cy;
+        Core.scene.touchDown(cx, sy, 0, KeyCode.mouseLeft);
+        Core.scene.touchUp(cx, sy, 0, KeyCode.mouseLeft);
+        syncMousePosition();
+    } catch (e) { logOnce("cmd click", e); }
+}
+
+function drawCommandPanel() {
+    var rows = cmdPanelData();
+    if (rows.length === 0) return;
+    cmdPanelClamp(rows);
+    var focused = rows[cmdRow][cmdCol];
+    Lines.stroke(4, Color.black);
+    Lines.rect(focused.x - 3, focused.y - 3, focused.w + 6, focused.h + 6);
+    Lines.stroke(2, Color.white);
+    Lines.rect(focused.x - 3, focused.y - 3, focused.w + 6, focused.h + 6);
     Draw.reset();
 }
 
@@ -1743,6 +1749,7 @@ Core.app.post(new java.lang.Runnable({
 Events.run(Trigger.draw, function () {
     try {
         if (!active() || !Vars.state.isGame()) return;
+        Vars.control.input.commandMode = (currentMode === MODE_COMMAND);
         if (currentMode === MODE_BUILD) {
             Draw.z(Layer.overlayUI);
             var pb = Vars.control.input.block;
@@ -1797,6 +1804,7 @@ try {
     Events.run(Trigger.uiDrawEnd, function () {
         try {
             if (!active() || cursorX < 0) return;
+            if (Vars.ui.minimapfrag != null && Vars.ui.minimapfrag.shown()) return;
             var w = Core.graphics.getWidth(), h = Core.graphics.getHeight();
             Draw.proj(Tmp.m1.setOrtho(0, 0, w, h));
 
@@ -1804,46 +1812,6 @@ try {
             var col = inUI ? Color.white :
                       (currentMode === MODE_NORMAL) ? Pal.accent :
                       (currentMode === MODE_BUILD) ? Pal.place : Pal.heal;
-
-            if (!inUI && Vars.state.isGame() && currentMode === MODE_NORMAL && inspectBuild != null) {
-                var items = getInspectItems(inspectBuild);
-                var topY = Math.round(h * 0.65);
-
-                Fonts.outline.draw(
-                    "[accent]" + inspectBuild.block.localizedName + " [lightgray](O - take / close)",
-                    PANEL_X, topY + 18, Align.left
-                );
-
-                if (items.length === 0) {
-                    Fonts.outline.draw("[lightgray]Empty", PANEL_X, topY - 10, Align.left);
-                } else {
-                    for (var ii = 0; ii < items.length; ii++) {
-                        var entry = items[ii];
-                        var ry = topY - (ii + 1) * (PANEL_ROW_H + PANEL_GAP);
-                        var hovered = (inspectHoverItem === entry.item);
-
-                        Draw.color(0, 0, 0, hovered ? 0.85 : 0.6);
-                        Fill.rect(PANEL_X + PANEL_W / 2, ry + PANEL_ROW_H / 2, PANEL_W, PANEL_ROW_H);
-
-                        if (hovered && cArmed && isDown(BTN_CIRCLE) && !cActed) {
-                            var prog = Mathf.clamp(cHold / HOLD_FRAMES, 0, 1);
-                            Draw.color(Pal.accent, 0.45);
-                            Fill.rect(PANEL_X + (PANEL_W * prog) / 2, ry + PANEL_ROW_H / 2, PANEL_W * prog, PANEL_ROW_H);
-                        }
-
-                        Lines.stroke(hovered ? 2 : 1, hovered ? Pal.accent : Color.gray);
-                        Lines.rect(PANEL_X, ry, PANEL_W, PANEL_ROW_H);
-                        Draw.reset();
-
-                        Draw.rect(entry.item.uiIcon, PANEL_X + 16, ry + PANEL_ROW_H / 2, 20, 20);
-                        Fonts.outline.draw(
-                            (hovered ? "[accent]" : "[white]") + entry.item.localizedName + ": [lightgray]" + entry.amount,
-                            PANEL_X + 32, ry + PANEL_ROW_H / 2 + 6, Align.left
-                        );
-                    }
-                }
-                Draw.reset();
-            }
 
             if (!inUI && Vars.state.isGame() && currentMode === MODE_COMMAND) drawCommandPanel(w, h);
 
